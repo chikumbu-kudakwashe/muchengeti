@@ -58,7 +58,7 @@ TRAFFIC_ACTION_DISTANCE_CM = 55
 # ULTRASONIC SETTINGS
 # --------------------------------------------------
 
-FRONT_BLOCKED_CM = 35
+FRONT_BLOCKED_CM = 25
 
 SIDE_DANGER_CM = 16
 SIDE_CAUTION_CM = 22
