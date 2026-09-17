@@ -3,156 +3,113 @@ import time
 
 class StartupDirectionDetector:
     """
-    Determine the course direction from the blue and orange lines.
+    Determine the course direction from the blue start line.
 
     The vehicle remains stationary for the complete scan. Several
     observations are collected because one camera frame should not
     decide the direction of the whole run.
 
-    Blue means left.
-    Orange means right.
+    We only ever look for BLUE. Orange and red sit close enough in
+    hue that lighting can flip one into the other on the K210's
+    fixed colour thresholds, so instead of trying to tell them
+    apart we treat "blue confirmed" and "blue not confirmed" as the
+    two outcomes - if blue is not seen, the course is assumed to be
+    the other (orange) direction rather than actively detecting
+    orange at all.
     """
 
     def __init__(
         self,
-        camera,
-        blue_index: int,
-        orange_index: int,
-        pixels_threshold: int,
-        area_threshold: int,
+        link,
         min_width: int,
         min_height: int,
-        min_area: int,
+        min_pixels: int,
         min_votes: int,
-        vote_margin: int,
         scan_ms: int,
-        sample_delay_ms: int
+        sample_delay_ms: int,
+        blue_direction: str = "left",
+        alt_direction: str = "right"
     ) -> None:
         """
         Store the startup colour detector configuration.
 
         Args:
-            camera: Initialised ACB_Canmv camera.
-            blue_index: K210 colour index for blue.
-            orange_index: K210 colour index for orange.
-            pixels_threshold: Minimum camera pixel threshold.
-            area_threshold: Minimum camera area threshold.
+            link: Connected K210Link.
             min_width: Minimum accepted blob width.
             min_height: Minimum accepted blob height.
-            min_area: Minimum accepted width x height.
-            min_votes: Minimum observations required for confidence.
-            vote_margin: Preferred lead between winning and losing colour.
+            min_pixels: Minimum accepted blob pixel count. The K210
+                already applies its own (looser) threshold before
+                reporting anything at all - this is a stricter
+                second filter on the ESP32 side.
+            min_votes: Minimum observations required to confirm blue.
             scan_ms: Amount of time the car stays stationary.
             sample_delay_ms: Delay between observation cycles.
+            blue_direction: Course direction when blue is confirmed.
+            alt_direction: Course direction when blue is not seen.
 
         Returns:
             None.
         """
 
-        self.camera = camera
-
-        self.blue_index = blue_index
-        self.orange_index = orange_index
-
-        self.pixels_threshold = pixels_threshold
-        self.area_threshold = area_threshold
+        self.link = link
 
         self.min_width = min_width
         self.min_height = min_height
-        self.min_area = min_area
+        self.min_pixels = min_pixels
 
         self.min_votes = min_votes
-        self.vote_margin = vote_margin
 
         self.scan_ms = scan_ms
         self.sample_delay_ms = sample_delay_ms
 
+        self.blue_direction = blue_direction
+        self.alt_direction = alt_direction
 
-    def _read_colour(self, index: int) -> dict:
+
+    def _blue_seen(self) -> bool:
         """
-        Read one K210 colour class and return its blob information.
-
-        A small blob is treated as noise. The lower thresholds make
-        the detector tolerant to dim lighting while the size check
-        stops isolated coloured pixels from becoming valid votes.
-
-        Args:
-            index: K210 colour-recognition index.
+        Poll the link once and check for a valid blue blob.
 
         Returns:
-            Dictionary containing detection information.
+            True if blue was reported and clears the size filters.
         """
 
-        detected = self.camera.color_recognize(
-            index,
-            self.pixels_threshold,
-            self.area_threshold
-        )
+        found = self.link.poll()
 
-        if not detected:
-            return {
-                "detected": False,
-                "width": 0,
-                "height": 0,
-                "area": 0
-            }
+        if not found or self.link.name != "blue":
+            return False
 
-        width = self.camera.getW
-        height = self.camera.getH
-        area = width * height
+        if self.link.w < self.min_width:
+            return False
 
-        if width < self.min_width:
-            return {
-                "detected": False,
-                "width": width,
-                "height": height,
-                "area": area
-            }
+        if self.link.h < self.min_height:
+            return False
 
-        if height < self.min_height:
-            return {
-                "detected": False,
-                "width": width,
-                "height": height,
-                "area": area
-            }
+        if self.link.pixels < self.min_pixels:
+            return False
 
-        if area < self.min_area:
-            return {
-                "detected": False,
-                "width": width,
-                "height": height,
-                "area": area
-            }
-
-        return {
-            "detected": True,
-            "width": width,
-            "height": height,
-            "area": area
-        }
+        return True
 
 
-    def detect(self, fallback_direction: str) -> str:
+    def detect(self) -> str:
         """
-        Scan blue and orange for ten seconds and select the direction.
+        Scan for blue for the configured duration and pick a side.
 
-        The detector uses a voting system rather than trusting one
-        frame. If both colours are visible in one cycle, the larger
-        valid blob receives the vote.
-
-        Args:
-            fallback_direction: Direction used if the result is tied.
+        We never look for orange. Its hue sits close enough to red
+        that lighting can flip the classification between the two,
+        so instead of comparing blue against orange votes, blue
+        alone must clear min_votes to be "confirmed" - anything
+        else (including a genuine orange line) falls through to
+        alt_direction.
 
         Returns:
-            "left" when blue wins or "right" when orange wins.
+            blue_direction if blue was confirmed, alt_direction
+            otherwise.
         """
+
+        self.link.set_mode(self.link.MODE_START)
 
         blue_votes = 0
-        orange_votes = 0
-
-        blue_area_total = 0
-        orange_area_total = 0
 
         started_ms = time.ticks_ms()
         last_status_ms = started_ms
@@ -161,9 +118,9 @@ class StartupDirectionDetector:
         print("================================")
         print("STARTUP DIRECTION SCAN")
         print("================================")
-        print("Car stationary for 10 seconds")
-        print("BLUE = LEFT")
-        print("ORANGE = RIGHT")
+        print("Car stationary, looking for BLUE only")
+        print("BLUE FOUND ->", self.blue_direction.upper())
+        print("BLUE NOT FOUND ->", self.alt_direction.upper())
         print("")
 
         while True:
@@ -178,43 +135,9 @@ class StartupDirectionDetector:
             if elapsed >= self.scan_ms:
                 break
 
-            blue = self._read_colour(
-                self.blue_index
-            )
-
-            orange = self._read_colour(
-                self.orange_index
-            )
-
-            # If both colours are reported in the same cycle we use
-            # the larger blob instead of giving both a vote.
-            if (
-                blue["detected"]
-                and
-                orange["detected"]
-            ):
-
-                if blue["area"] >= orange["area"]:
-
-                    blue_votes += 1
-                    blue_area_total += blue["area"]
-
-                else:
-
-                    orange_votes += 1
-                    orange_area_total += orange["area"]
-
-
-            elif blue["detected"]:
+            if self._blue_seen():
 
                 blue_votes += 1
-                blue_area_total += blue["area"]
-
-
-            elif orange["detected"]:
-
-                orange_votes += 1
-                orange_area_total += orange["area"]
 
 
             if time.ticks_diff(
@@ -231,9 +154,7 @@ class StartupDirectionDetector:
                     "SCAN:",
                     remaining,
                     "s | BLUE:",
-                    blue_votes,
-                    "| ORANGE:",
-                    orange_votes
+                    blue_votes
                 )
 
                 last_status_ms = now
@@ -246,94 +167,20 @@ class StartupDirectionDetector:
 
         print("")
         print(
-            "FINAL VOTES | BLUE:",
-            blue_votes,
-            "| ORANGE:",
-            orange_votes
-        )
-
-
-        # Clear result with our preferred confidence margin.
-        if (
-            blue_votes >= self.min_votes
-            and
+            "FINAL BLUE VOTES:",
             blue_votes
-            >=
-            orange_votes + self.vote_margin
-        ):
-
-            print("START LINE: BLUE")
-            print("COURSE DIRECTION: LEFT")
-
-            return "left"
-
-
-        if (
-            orange_votes >= self.min_votes
-            and
-            orange_votes
-            >=
-            blue_votes + self.vote_margin
-        ):
-
-            print("START LINE: ORANGE")
-            print("COURSE DIRECTION: RIGHT")
-
-            return "right"
-
-
-        # If there is no full confidence margin but one colour has
-        # still been seen more often, use the stronger observation.
-        if (
-            blue_votes >= self.min_votes
-            and
-            blue_votes > orange_votes
-        ):
-
-            print("LOW CONFIDENCE BLUE")
-            print("COURSE DIRECTION: LEFT")
-
-            return "left"
-
-
-        if (
-            orange_votes >= self.min_votes
-            and
-            orange_votes > blue_votes
-        ):
-
-            print("LOW CONFIDENCE ORANGE")
-            print("COURSE DIRECTION: RIGHT")
-
-            return "right"
-
-
-        # Area gives us one last useful comparison in a close vote.
-        if (
-            blue_area_total > orange_area_total
-            and
-            blue_area_total > 0
-        ):
-
-            print("CLOSE VOTE - BLUE HAD LARGER BLOBS")
-
-            return "left"
-
-
-        if (
-            orange_area_total > blue_area_total
-            and
-            orange_area_total > 0
-        ):
-
-            print("CLOSE VOTE - ORANGE HAD LARGER BLOBS")
-
-            return "right"
-
-
-        print(
-            "NO RELIABLE START COLOUR - FALLBACK:",
-            fallback_direction.upper()
         )
 
-        return fallback_direction
+
+        if blue_votes >= self.min_votes:
+
+            print("BLUE CONFIRMED")
+            print("COURSE DIRECTION:", self.blue_direction.upper())
+
+            return self.blue_direction
+
+
+        print("BLUE NOT CONFIRMED - ASSUMING ORANGE")
+        print("COURSE DIRECTION:", self.alt_direction.upper())
+
+        return self.alt_direction

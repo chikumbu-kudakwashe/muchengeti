@@ -1,4 +1,4 @@
-"""
+﻿"""
 Muchengeti runtime configuration.
 
 Values in this file are kept separate from the navigation logic so
@@ -13,6 +13,12 @@ the state machine.
 
 # Zimbabwe Nationals practice / competition field.
 MAT_SIZE_CM = 200
+
+# Width of the driving lane the car travels along (outer wall to
+# the center obstacle). Used as a sanity ceiling on how far the car
+# is allowed to shift sideways when avoiding a traffic pillar - see
+# SIDESTEP SIZING below.
+TRACK_LANE_WIDTH_CM = 70
 
 
 # ============================================================
@@ -43,67 +49,66 @@ DEFAULT_TURN_DIRECTION = "left"
 
 
 # ============================================================
-# K210 COLOUR INDEXES
+# K210 LINK
 # ============================================================
 #
-# These indexes depend on the colour table stored inside the
-# K210 firmware.
+# The K210 now runs our own text-protocol vision firmware (see
+# libs/k210_link.py and the K210-side main.py/README_K210.txt)
+# instead of the original ACEBOTT binary packet firmware. Colours
+# are identified by name over UART, not by index, and blob-size
+# filtering happens on the K210 itself (PIXELS_THRESHOLD/
+# AREA_THRESHOLD in the K210's main.py) before anything is even
+# reported - the MIN_WIDTH/MIN_HEIGHT/MIN_PIXELS settings below are
+# just a stricter second filter applied on the ESP32 side.
 #
-# Our current firmware setup uses:
-#
-#   1 = red
-#   2 = green
-#   3 = orange
-#   4 = blue
-#
-# Verify 3 and 4 on the real camera before the competition.
+# These are the same physical UART pins the old ACB_Canmv camera
+# used (labelled SDA/SCL there, which was a misnomer - they were
+# always UART rx/tx).
 # ============================================================
 
-RED_INDEX = 1
-GREEN_INDEX = 2
-
-ORANGE_INDEX = 3
-BLUE_INDEX = 4
+K210_RX_PIN = 21
+K210_TX_PIN = 22
+K210_BAUD = 115200
 
 
 # ============================================================
-# STARTUP BLUE / ORANGE FILTERING
+# STARTUP BLUE FILTERING
 # ============================================================
 #
-# These values are deliberately permissive.
-#
-# We do not want to reject the line just because the lighting
-# has made it darker or lighter than expected.
-#
-# IMPORTANT:
-# These settings control blob acceptance. They do not change the
-# actual LAB/HSV colour range stored inside the K210 firmware.
+# These values are deliberately permissive. We do not want to
+# reject the line just because the lighting has made it darker or
+# lighter than expected.
 # ============================================================
-
-START_COLOR_PIXELS_THRESHOLD = 40
-START_COLOR_AREA_THRESHOLD = 40
 
 START_COLOR_MIN_WIDTH = 4
 START_COLOR_MIN_HEIGHT = 3
-START_COLOR_MIN_AREA = 20
+START_COLOR_MIN_PIXELS = 20
 
-# The winning colour should be seen several times.
+# Blue must be seen at least this many times during the scan to be
+# confirmed. Not seeing it is treated as the orange/alt direction -
+# we no longer actively look for orange (see navigation/startup.py).
 START_COLOR_MIN_VOTES = 2
-
-# A colour should preferably lead the other by this many votes.
-START_COLOR_VOTE_MARGIN = 2
 
 
 # ============================================================
 # TRAFFIC SIGN FILTERING
 # ============================================================
 
-TRAFFIC_PIXELS_THRESHOLD = 60
-TRAFFIC_AREA_THRESHOLD = 60
-
 TRAFFIC_MIN_WIDTH = 5
-TRAFFIC_MIN_HEIGHT = 5
-TRAFFIC_MIN_AREA = 40
+
+# The orange/red corner-direction line painted on the mat is flat
+# on the ground, so the camera sees it as a short, wide blob - a
+# real pillar is a standing rectangular block and should read
+# taller. Raising this above pure noise-rejection height is meant
+# to tell the two apart, BUT 30 turned out to also reject genuine
+# GREEN pillars until they were nearly passed (too strict). Backed
+# off to a gentler value - use tests/traffic_calibration.py to read
+# real width/height/pixels for the mat line vs each pillar colour
+# on your camera and set this from actual numbers instead of a
+# guess.
+TRAFFIC_MIN_HEIGHT = 15
+
+TRAFFIC_MIN_PIXELS = 40
 
 # We currently allow one good observation to lock a pillar.
 # Raise this to 2 if false detections become common.
@@ -131,9 +136,15 @@ CORNER_TURN_SPEED = 120
 CORNER_EXIT_SPEED = 150
 
 TRAFFIC_APPROACH_SPEED = 150
-TRAFFIC_SHIFT_SPEED = 150
+
+# Speed for the diagonal-forward lean used to pass a pillar (see
+# Race.shift_away_from_pillar/shift_back_to_route) - a gentle lean
+# to one side while still driving forward, not a sideways strafe or
+# an in-place turn.
+TRAFFIC_SHIFT_SPEED = 110
+TRAFFIC_RECENTER_SPEED = 110
+
 TRAFFIC_PASS_SPEED = 170
-TRAFFIC_RECENTER_SPEED = 150
 
 FINISH_SPEED = 180
 
@@ -152,7 +163,6 @@ BOUNDARY_CLASSIFY_CM = 70
 
 # Physical corner manoeuvre starts here.
 TURN_TRIGGER_CM = 28
-
 # Last-resort collision protection.
 EMERGENCY_CM = 9
 
@@ -209,7 +219,7 @@ CORNER_RECOVERY_MS = 280
 # TRAFFIC PILLAR
 # ============================================================
 
-# Begin the sideways avoidance once the pillar is this close.
+# Begin the avoidance lean once the pillar is this close.
 TRAFFIC_PASS_TRIGGER_CM = 40
 
 # ------------------------------------------------------------
@@ -218,22 +228,33 @@ TRAFFIC_PASS_TRIGGER_CM = 40
 #
 # Pillars on this mat are not all the same distance into the lane
 # - some sit close to the outer wall, others sit further toward
-# the center obstacle. A single fixed shift is either too much or
-# too little depending on where the pillar actually is, so the
-# shift duration is scaled by how far off-center the pillar's
-# camera blob (getCX) is at the moment we commit to passing it.
+# the center obstacle. A single fixed lean duration is either too
+# much or too little depending on where the pillar actually is, so
+# it is scaled by how far off-center the pillar's camera blob
+# (getCX) is at the moment we commit to passing it.
 #
 # CALIBRATE ON THE REAL CAMERA: TRAFFIC_CAMERA_CENTER_X should be
 # the getCX reading for a pillar dead-center in frame, and
 # TRAFFIC_CX_FULL_OFFSET_PX the offset (in the same units) at
 # which the pillar is already at the edge of the lane.
+#
+# TRAFFIC_SHIFT_MS_MAX must never let the car drift further
+# sideways than the lane actually allows (TRACK_LANE_WIDTH_CM,
+# ~70cm) - overshooting that turns a pillar dodge into a wall hit
+# on the other side of the lane. This is now a forward-diagonal
+# lean (Race.shift_away_from_pillar), not a sideways strafe, so it
+# also keeps making forward progress the whole time - to calibrate,
+# time how many centimetres it drifts sideways over a fixed known
+# duration at TRAFFIC_SHIFT_SPEED (mark the floor, measure the
+# sideways offset only), then set MAX so the worst case stays well
+# under half the lane width.
 
 TRAFFIC_CAMERA_CENTER_X = 160
 
 TRAFFIC_CX_FULL_OFFSET_PX = 80
 
-TRAFFIC_SHIFT_MS_MIN = 250
-TRAFFIC_SHIFT_MS_MAX = 550
+TRAFFIC_SHIFT_MS_MIN = 270
+TRAFFIC_SHIFT_MS_MAX = 500
 
 # We do not look for the end of a pillar immediately.
 TRAFFIC_MIN_PASS_MS = 450
@@ -250,18 +271,14 @@ TRAFFIC_LOST_CONFIRMATIONS = 2
 # rather than a long blanket cooldown.
 TRAFFIC_COOLDOWN_MS = 300
 
-# After undoing the sideways shift, use the camera's line-following
-# error to confirm the car is actually back at track center instead
-# of trusting the timed strafe alone (motor response is never
-# perfectly symmetric, so blind timing drifts over a run).
+# After undoing the sideways shift, drive straight for this long
+# before declaring the pillar manoeuvre complete.
 #
-# The reading must stay centered for this long before the pillar
-# manoeuvre is considered complete.
-RECENTER_CONFIRM_MS = 120
-
-# Do not let camera-based recentering run forever if the track
-# camera cannot get a usable reading (e.g. still mid-shift).
-RECENTER_CAMERA_TIMEOUT_MS = 700
+# The new K210 firmware only reports colour blobs - it dropped
+# line-following (visual_patrol), so there is no camera signal left
+# to confirm we are actually back at track center. This is a plain
+# timed forward burst, same as the shift-out/shift-back timing.
+RECENTER_FORWARD_MS = 220
 
 # Camera scan interval while travelling on the straight.
 TRAFFIC_SCAN_INTERVAL_MS = 250
@@ -272,6 +289,16 @@ TRAFFIC_SCAN_INTERVAL_MS = 250
 # ============================================================
 
 ULTRASONIC_INTERVAL_MS = 80
+
+
+# ============================================================
+# INDICATOR LEDS
+# ============================================================
+
+LED_LEFT_PIN = 2
+LED_RIGHT_PIN = 12
+
+LED_PWM_FREQ = 1000
 
 
 # ============================================================

@@ -13,8 +13,13 @@ Current objectives:
 8. Count only real 90-degree track turns.
 9. Four turns make one lap.
 10. Stop after twelve turns / three laps near the starting point.
+11. Signal turns and pillar passes on the indicator LEDs.
 
 Parking will be added as the next phase.
+
+All of the non-state-machine logic (distance smoothing, traffic
+scanning/sizing, corner pivoting, lap/finish timing, LEDs) lives in
+navigation.race.Race - this file is only the state machine.
 """
 
 import time
@@ -23,12 +28,13 @@ import config.settings as settings
 
 import hardware.car as Car
 import hardware.ultrasonic as Ultrasonic
+import hardware.leds as Leds
 
-from libs import ACB_Canmv
+from libs.k210_link import K210Link
 
 from navigation.startup import StartupDirectionDetector
 from navigation.traffic import TrafficColorDetector
-from navigation.track import TrackFollower
+from navigation.race import Race, is_valid_distance
 
 
 # ============================================================
@@ -39,11 +45,18 @@ car = Car.Car()
 
 ultrasonic = Ultrasonic.UltrasonicScanner()
 
-cam = ACB_Canmv.ACB_Canmv()
+leds = Leds.Leds(
+    settings.LED_LEFT_PIN,
+    settings.LED_RIGHT_PIN,
+    settings.LED_PWM_FREQ
+)
 
-cam.init(
-    cam.SDA,
-    cam.SCL
+# Text-protocol K210 vision link (see libs/k210_link.py) - replaces
+# the old ACB_Canmv binary-packet camera driver.
+link = K210Link(
+    settings.K210_RX_PIN,
+    settings.K210_TX_PIN,
+    settings.K210_BAUD
 )
 
 
@@ -70,686 +83,35 @@ state = DRIVING
 
 
 # ============================================================
-# STARTUP DETECTOR
+# DETECTORS / RACE SUPPORT
 # ============================================================
 
 startup_detector = StartupDirectionDetector(
-    camera=cam,
-
-    blue_index=settings.BLUE_INDEX,
-    orange_index=settings.ORANGE_INDEX,
-
-    pixels_threshold=(
-        settings.START_COLOR_PIXELS_THRESHOLD
-    ),
-
-    area_threshold=(
-        settings.START_COLOR_AREA_THRESHOLD
-    ),
-
-    min_width=(
-        settings.START_COLOR_MIN_WIDTH
-    ),
-
-    min_height=(
-        settings.START_COLOR_MIN_HEIGHT
-    ),
-
-    min_area=(
-        settings.START_COLOR_MIN_AREA
-    ),
-
-    min_votes=(
-        settings.START_COLOR_MIN_VOTES
-    ),
-
-    vote_margin=(
-        settings.START_COLOR_VOTE_MARGIN
-    ),
-
-    scan_ms=(
-        settings.STARTUP_SCAN_MS
-    ),
-
-    sample_delay_ms=(
-        settings.STARTUP_SAMPLE_DELAY_MS
-    )
+    link=link,
+    min_width=settings.START_COLOR_MIN_WIDTH,
+    min_height=settings.START_COLOR_MIN_HEIGHT,
+    min_pixels=settings.START_COLOR_MIN_PIXELS,
+    min_votes=settings.START_COLOR_MIN_VOTES,
+    scan_ms=settings.STARTUP_SCAN_MS,
+    sample_delay_ms=settings.STARTUP_SAMPLE_DELAY_MS,
+    blue_direction=settings.BLUE_TURN_DIRECTION,
+    alt_direction=settings.ORANGE_TURN_DIRECTION
 )
-
-
-# ============================================================
-# TRAFFIC DETECTOR
-# ============================================================
-
-track_follower = TrackFollower(car)
 
 traffic_detector = TrafficColorDetector(
-    cam=cam,
-
-    red_index=settings.RED_INDEX,
-    green_index=settings.GREEN_INDEX,
-
-    pixels_threshold=(
-        settings.TRAFFIC_PIXELS_THRESHOLD
-    ),
-
-    area_threshold=(
-        settings.TRAFFIC_AREA_THRESHOLD
-    ),
-
-    min_width=(
-        settings.TRAFFIC_MIN_WIDTH
-    ),
-
-    min_height=(
-        settings.TRAFFIC_MIN_HEIGHT
-    ),
-
-    min_area=(
-        settings.TRAFFIC_MIN_AREA
-    ),
-
-    confirmations=(
-        settings.TRAFFIC_CONFIRMATIONS
-    )
+    link=link,
+    min_width=settings.TRAFFIC_MIN_WIDTH,
+    min_height=settings.TRAFFIC_MIN_HEIGHT,
+    min_pixels=settings.TRAFFIC_MIN_PIXELS,
+    confirmations=settings.TRAFFIC_CONFIRMATIONS
 )
 
-
-# ============================================================
-# RACE STATE
-# ============================================================
-
-course_direction = (
-    settings.DEFAULT_TURN_DIRECTION
+race = Race(
+    car,
+    ultrasonic,
+    traffic_detector,
+    leds
 )
-
-total_turns = 0
-
-race_complete = False
-
-
-# ============================================================
-# ULTRASONIC STATE
-# ============================================================
-
-front_distance = 999
-
-last_ultrasonic_ms = (
-    time.ticks_ms()
-)
-
-
-# ============================================================
-# CORNER STATE
-# ============================================================
-
-active_corner_direction = None
-
-# Consecutive close-range frames with no traffic colour detected.
-# Used to require several bad reads before committing to a wall.
-wall_no_color_streak = 0
-
-turn_started_ms = 0
-
-turn_saw_close_wall = False
-
-corner_trim_started_ms = 0
-
-corner_recovery_started_ms = 0
-
-
-# ============================================================
-# TRAFFIC STATE
-# ============================================================
-
-active_traffic_color = None
-
-active_traffic_direction = None
-
-active_traffic_cx = settings.TRAFFIC_CAMERA_CENTER_X
-
-active_traffic_shift_ms = settings.TRAFFIC_SHIFT_MS_MIN
-
-traffic_shift_started_ms = 0
-
-traffic_pass_started_ms = 0
-
-traffic_recenter_started_ms = 0
-
-traffic_recenter_phase = 0
-
-traffic_centered_since_ms = 0
-
-traffic_lost_count = 0
-
-last_traffic_scan_ms = 0
-
-last_traffic_completed_ms = (
-    time.ticks_ms()
-)
-
-
-# ============================================================
-# FINISH POSITION LEARNING
-# ============================================================
-
-run_started_ms = 0
-
-straight_started_ms = 0
-
-first_partial_straight_ms = None
-
-clean_straight_samples = []
-
-traffic_seen_on_current_straight = False
-
-finish_started_ms = 0
-
-finish_drive_ms = (
-    settings.FINISH_FORWARD_FALLBACK_MS
-)
-
-
-# ============================================================
-# DISTANCE HELPERS
-# ============================================================
-
-def is_valid_distance(distance: float) -> bool:
-    """
-    Check whether an ultrasonic value can be trusted.
-
-    Args:
-        distance: Distance returned by the ultrasonic sensor.
-
-    Returns:
-        True for a usable distance reading.
-    """
-
-    if distance is None:
-        return False
-
-    if distance <= 0:
-        return False
-
-    if distance >= settings.MAX_VALID_DISTANCE_CM:
-        return False
-
-    return True
-
-
-def update_front_distance() -> float:
-    """
-    Refresh the front ultrasonic reading at a controlled rate.
-
-    Invalid readings are replaced with 999 rather than keeping an
-    old close distance that could trigger another false corner.
-
-    Returns:
-        Current front distance in centimetres.
-    """
-
-    global front_distance
-    global last_ultrasonic_ms
-
-    now = time.ticks_ms()
-
-    if time.ticks_diff(
-        now,
-        last_ultrasonic_ms
-    ) < settings.ULTRASONIC_INTERVAL_MS:
-
-        return front_distance
-
-
-    distance = (
-        ultrasonic.get_stable_distance()
-    )
-
-
-    if is_valid_distance(distance):
-
-        front_distance = distance
-
-    else:
-
-        front_distance = 999
-
-
-    last_ultrasonic_ms = now
-
-    return front_distance
-
-
-def read_track() -> tuple:
-    """
-    Read the camera's line-following error.
-
-    Used only to confirm/steer back to track center after a traffic
-    pillar manoeuvre - normal straight-line driving is otherwise
-    open-loop and relies on the ultrasonic for corner timing.
-
-    Returns:
-        (True, error) if the camera has a usable line reading.
-        (False, 0) otherwise.
-    """
-
-    if cam.visual_patrol():
-
-        return True, cam.Visual_data
-
-    return False, 0
-
-
-# ============================================================
-# TRAFFIC HELPERS
-# ============================================================
-
-def scan_traffic_sign() -> object:
-    """
-    Check the camera for a red or green traffic pillar.
-
-    Returns:
-        Traffic-sign dictionary or None.
-    """
-
-    result = traffic_detector.detect()
-
-    if result is None:
-        return None
-
-
-    print(
-        "TRAFFIC:",
-        result["color"].upper(),
-        "PASS:",
-        result["direction"].upper(),
-        "W:",
-        result["width"],
-        "H:",
-        result["height"],
-        "AREA:",
-        result["area"]
-    )
-
-    return result
-
-
-def compute_shift_ms(cx: int) -> int:
-    """
-    Size the sideways avoidance shift to how off-center a pillar is.
-
-    A pillar close to the camera's center line is likely already
-    close to the outer wall or the center obstacle and needs a
-    smaller sideways move; one far off-center needs more clearance.
-    Scales linearly between TRAFFIC_SHIFT_MS_MIN and _MAX using the
-    blob's horizontal camera position (getCX).
-
-    Args:
-        cx: Horizontal camera position of the pillar blob.
-
-    Returns:
-        Shift duration in milliseconds.
-    """
-
-    offset = abs(
-        cx - settings.TRAFFIC_CAMERA_CENTER_X
-    )
-
-    fraction = (
-        offset
-        /
-        settings.TRAFFIC_CX_FULL_OFFSET_PX
-    )
-
-    if fraction > 1:
-        fraction = 1
-
-    return int(
-        settings.TRAFFIC_SHIFT_MS_MIN
-        +
-        fraction
-        *
-        (
-            settings.TRAFFIC_SHIFT_MS_MAX
-            -
-            settings.TRAFFIC_SHIFT_MS_MIN
-        )
-    )
-
-
-def shift_away_from_pillar(direction: str) -> None:
-    """
-    Move sideways to the correct side of a traffic pillar.
-
-    Red gives direction='right'.
-    Green gives direction='left'.
-
-    Args:
-        direction: Side on which the pillar must be passed.
-
-    Returns:
-        None.
-    """
-
-    if direction == "right":
-
-        car.strafe_right(
-            settings.TRAFFIC_SHIFT_SPEED
-        )
-
-    else:
-
-        car.strafe_left(
-            settings.TRAFFIC_SHIFT_SPEED
-        )
-
-
-def shift_back_to_route(direction: str) -> None:
-    """
-    Undo the sideways movement used to pass a pillar.
-
-    Args:
-        direction: Original traffic-passing direction.
-
-    Returns:
-        None.
-    """
-
-    if direction == "right":
-
-        car.strafe_left(
-            settings.TRAFFIC_RECENTER_SPEED
-        )
-
-    else:
-
-        car.strafe_right(
-            settings.TRAFFIC_RECENTER_SPEED
-        )
-
-
-# ============================================================
-# CORNER HELPERS
-# ============================================================
-
-def drive_corner(direction: str, speed: int = None) -> None:
-    """
-    Pivot the car in place through a 90-degree track turn.
-
-    The ultrasonic is fixed facing forward, so rotating in place
-    sweeps it away from the old wall and toward the new straight.
-    The CORNER_TURNING state watches that sweep to decide when the
-    turn is done.
-
-    Args:
-        direction: "left" or "right".
-        speed: Rotation speed. Defaults to CORNER_TURN_SPEED.
-
-    Returns:
-        None.
-    """
-
-    if speed is None:
-        speed = settings.CORNER_TURN_SPEED
-
-    if direction == "left":
-
-        car.rotate_left(
-            speed
-        )
-
-    else:
-
-        car.rotate_right(
-            speed
-        )
-
-
-def current_lap() -> int:
-    """
-    Return the lap currently being driven.
-
-    Returns:
-        Lap number from 1 to 3.
-    """
-
-    lap = (
-        total_turns
-        // settings.TURNS_PER_LAP
-    ) + 1
-
-    if lap > settings.TOTAL_LAPS:
-        lap = settings.TOTAL_LAPS
-
-    return lap
-
-
-def record_straight_before_corner() -> None:
-    """
-    Record straight-section timing for finish-position estimation.
-
-    The first measurement is the distance in time from the starting
-    position to the first corner. Later clean straight sections give
-    us an estimate of a complete straight.
-
-    Straights containing a traffic avoidance manoeuvre are ignored
-    because the sideways movement changes their elapsed time.
-
-    Returns:
-        None.
-    """
-
-    global first_partial_straight_ms
-
-    now = time.ticks_ms()
-
-    elapsed = time.ticks_diff(
-        now,
-        straight_started_ms
-    )
-
-
-    if total_turns == 0:
-
-        if first_partial_straight_ms is None:
-
-            first_partial_straight_ms = elapsed
-
-            print(
-                "START OFFSET LEARNED:",
-                first_partial_straight_ms,
-                "ms"
-            )
-
-        return
-
-
-    if traffic_seen_on_current_straight:
-
-        print(
-            "STRAIGHT TIMING IGNORED - TRAFFIC MANOEUVRE"
-        )
-
-        return
-
-
-    if elapsed < 200:
-
-        return
-
-
-    clean_straight_samples.append(
-        elapsed
-    )
-
-
-    # Keep the most recent values only.
-    if len(clean_straight_samples) > 8:
-
-        clean_straight_samples.pop(0)
-
-
-    print(
-        "CLEAN STRAIGHT:",
-        elapsed,
-        "ms"
-    )
-
-
-def median(values: list) -> int:
-    """
-    Return the median integer from a list.
-
-    Args:
-        values: Numeric values.
-
-    Returns:
-        Median value or zero for an empty list.
-    """
-
-    if not values:
-        return 0
-
-    ordered = list(values)
-
-    ordered.sort()
-
-    count = len(ordered)
-
-    middle = count // 2
-
-    if count % 2 == 1:
-
-        return ordered[middle]
-
-
-    return (
-        ordered[middle - 1]
-        +
-        ordered[middle]
-    ) // 2
-
-
-def estimate_finish_drive_time() -> int:
-    """
-    Estimate how far to drive after the twelfth corner.
-
-    After turn 12 we are back on the straight containing the original
-    start. A learned full-straight time minus the original start-to-
-    first-corner time gives an approximate corner-to-start time.
-
-    Returns:
-        Forward-driving time in milliseconds.
-    """
-
-    if first_partial_straight_ms is None:
-
-        return settings.FINISH_FORWARD_FALLBACK_MS
-
-
-    full_straight_ms = median(
-        clean_straight_samples
-    )
-
-
-    if full_straight_ms <= 0:
-
-        return settings.FINISH_FORWARD_FALLBACK_MS
-
-
-    estimate = (
-        full_straight_ms
-        -
-        first_partial_straight_ms
-    )
-
-
-    if estimate < 0:
-
-        estimate = 0
-
-
-    if estimate > settings.FINISH_FORWARD_MAX_MS:
-
-        estimate = (
-            settings.FINISH_FORWARD_MAX_MS
-        )
-
-
-    return estimate
-
-
-def count_completed_corner() -> None:
-    """
-    Count one completed physical 90-degree track corner.
-
-    This is the only function that changes total_turns. Traffic
-    manoeuvres never call this function.
-
-    Returns:
-        None.
-    """
-
-    global total_turns
-
-    total_turns += 1
-
-
-    turn_in_lap = (
-        (total_turns - 1)
-        %
-        settings.TURNS_PER_LAP
-    ) + 1
-
-
-    lap_number = (
-        (total_turns - 1)
-        //
-        settings.TURNS_PER_LAP
-    ) + 1
-
-
-    print("")
-    print("================================")
-
-    print(
-        "90 DEGREE TURN COMPLETE"
-    )
-
-    print(
-        "TOTAL:",
-        total_turns,
-        "/",
-        settings.TOTAL_TURNS
-    )
-
-    print(
-        "LAP:",
-        lap_number,
-        "TURN:",
-        turn_in_lap,
-        "/",
-        settings.TURNS_PER_LAP
-    )
-
-
-    if (
-        total_turns
-        %
-        settings.TURNS_PER_LAP
-        ==
-        0
-    ):
-
-        print(
-            "LAP",
-            lap_number,
-            "COMPLETE"
-        )
-
-
-    print("================================")
-    print("")
 
 
 # ============================================================
@@ -760,67 +122,26 @@ car.stop()
 
 print("")
 print("================================")
-print("MUCHENGETI")
-print("WRO AUTONOMOUS NAVIGATION")
+print("MUCHENGETI - WRO AUTONOMOUS NAVIGATION")
 print("================================")
-
-print(
-    "Zimbabwe field:",
-    settings.MAT_SIZE_CM,
-    "cm x",
-    settings.MAT_SIZE_CM,
-    "cm"
-)
-
-print(
-    "Race target:",
-    settings.TOTAL_LAPS,
-    "laps /",
-    settings.TOTAL_TURNS,
-    "corners"
-)
-
+print("Field:", settings.MAT_SIZE_CM, "x", settings.MAT_SIZE_CM, "cm")
+print("Target:", settings.TOTAL_LAPS, "laps /", settings.TOTAL_TURNS, "corners")
 print("")
 
+# Startup scan: blue confirmed -> BLUE_TURN_DIRECTION, otherwise
+# assumed orange -> ORANGE_TURN_DIRECTION.
+race.course_direction = startup_detector.detect()
 
-# ============================================================
-# 10 SECOND BLUE / ORANGE SCAN
-# ============================================================
-
-course_direction = (
-    startup_detector.detect(
-        settings.DEFAULT_TURN_DIRECTION
-    )
-)
-
-settings.DEFAULT_TURN_DIRECTION = (
-    course_direction
-)
-
+settings.DEFAULT_TURN_DIRECTION = race.course_direction
 
 print("")
-print("================================")
-print(
-    "COURSE LOCKED:",
-    course_direction.upper()
-)
-print("================================")
+print("COURSE LOCKED:", race.course_direction.upper())
 print("")
 
 time.sleep_ms(500)
 
-
-# ============================================================
-# BEGIN RACE
-# ============================================================
-
-run_started_ms = (
-    time.ticks_ms()
-)
-
-straight_started_ms = (
-    run_started_ms
-)
+race.run_started_ms = time.ticks_ms()
+race.straight_started_ms = race.run_started_ms
 
 
 # ============================================================
@@ -832,231 +153,98 @@ while True:
     now = time.ticks_ms()
 
 
-    # ========================================================
+    # --------------------------------------------------
     # FINISHED
-    # ========================================================
+    # --------------------------------------------------
 
     if state == FINISHED:
 
         car.stop()
 
         print("")
-        print("================================")
-        print("RACE COMPLETE")
-        print(
-            settings.TOTAL_LAPS,
-            "LAPS COMPLETE"
-        )
-        print(
-            settings.TOTAL_TURNS,
-            "TRACK TURNS COMPLETE"
-        )
-        print("CAR STOPPED")
-        print("================================")
-        print("")
+        print("RACE COMPLETE -", settings.TOTAL_LAPS, "laps,", settings.TOTAL_TURNS, "turns")
 
         break
 
 
-    # ========================================================
+    # --------------------------------------------------
     # NORMAL DRIVING
-    # ========================================================
+    # --------------------------------------------------
 
     if state == DRIVING:
 
-        # Time Attack straight.
-        car.forward(
-            settings.DRIVE_SPEED
-        )
+        car.forward(settings.DRIVE_SPEED)
 
+        distance = race.update_front_distance()
 
-        distance = update_front_distance()
+        # Periodic traffic scan - a pillar may not be centered in
+        # the ultrasonic beam, so this runs even when nothing close
+        # has been detected yet.
+        cooldown_done = time.ticks_diff(now, race.last_traffic_completed_ms) >= settings.TRAFFIC_COOLDOWN_MS
+        scan_due = time.ticks_diff(now, race.last_traffic_scan_ms) >= settings.TRAFFIC_SCAN_INTERVAL_MS
 
+        if cooldown_done and scan_due:
 
-        # ----------------------------------------------------
-        # Periodic traffic scan.
-        #
-        # We scan even when the ultrasonic does not see a close
-        # object because a pillar may not be exactly in the centre
-        # of the ultrasonic beam.
-        # ----------------------------------------------------
+            race.last_traffic_scan_ms = now
 
-        traffic_cooldown_finished = (
-            time.ticks_diff(
-                now,
-                last_traffic_completed_ms
-            )
-            >=
-            settings.TRAFFIC_COOLDOWN_MS
-        )
-
-
-        if (
-            traffic_cooldown_finished
-            and
-            time.ticks_diff(
-                now,
-                last_traffic_scan_ms
-            )
-            >=
-            settings.TRAFFIC_SCAN_INTERVAL_MS
-        ):
-
-            last_traffic_scan_ms = now
-
-            traffic = (
-                scan_traffic_sign()
-            )
-
+            traffic = race.scan_traffic_sign()
 
             if traffic is not None:
 
-                active_traffic_color = (
-                    traffic["color"]
-                )
+                race.lock_traffic(traffic)
 
-                active_traffic_direction = (
-                    traffic["direction"]
-                )
-
-                active_traffic_cx = (
-                    traffic["cx"]
-                )
-
-                traffic_seen_on_current_straight = True
-
-
-                print("")
-                print(
-                    "PILLAR LOCKED:",
-                    active_traffic_color.upper()
-                )
-
-                print(
-                    "PASS:",
-                    active_traffic_direction.upper()
-                )
-
-                print("")
-
+                print("PILLAR LOCKED:", race.active_traffic_color.upper(), "PASS:", race.active_traffic_direction.upper())
 
                 state = TRAFFIC_APPROACH
 
                 continue
 
+        # Something is close - slow down and classify it before a
+        # camera-switch delay lets us hit it at full speed.
+        if is_valid_distance(distance) and distance <= settings.BOUNDARY_CLASSIFY_CM:
 
-        # ----------------------------------------------------
-        # Something is getting close.
-        #
-        # Do not hit a wall at full speed while the K210 spends
-        # time switching between red and green recognition.
-        # ----------------------------------------------------
+            car.forward(settings.CLASSIFICATION_SPEED)
 
-        if (
-            is_valid_distance(distance)
-            and
-            distance
-            <=
-            settings.BOUNDARY_CLASSIFY_CM
-        ):
-
-            car.forward(
-                settings.CLASSIFICATION_SPEED
-            )
-
-
-            # One final traffic check decides whether the close
-            # object is a pillar or the track wall.
-            traffic = (
-                scan_traffic_sign()
-            )
-
+            traffic = race.scan_traffic_sign()
 
             if traffic is not None:
 
-                active_traffic_color = (
-                    traffic["color"]
-                )
+                race.lock_traffic(traffic)
 
-                active_traffic_direction = (
-                    traffic["direction"]
-                )
-
-                active_traffic_cx = (
-                    traffic["cx"]
-                )
-
-                traffic_seen_on_current_straight = True
-
-                wall_no_color_streak = 0
+                race.wall_no_color_streak = 0
 
                 state = TRAFFIC_APPROACH
 
                 continue
 
+            # A single missed colour read is not enough evidence to
+            # commit to an irreversible 90 degree turn.
+            race.wall_no_color_streak += 1
 
-            # No red or green on this frame.
-            #
-            # A single missed read is not enough evidence to commit
-            # to an irreversible 90 degree turn - this mat can have
-            # a pillar sitting right where a corner would also be
-            # expected, so require several consecutive bad reads
-            # before treating it as the boundary wall.
-            wall_no_color_streak += 1
-
-            if wall_no_color_streak < settings.WALL_CONFIRM_COUNT:
+            if race.wall_no_color_streak < settings.WALL_CONFIRM_COUNT:
 
                 continue
 
+            race.wall_no_color_streak = 0
 
-            wall_no_color_streak = 0
+            race.lock_corner(race.course_direction)
 
-            active_corner_direction = (
-                course_direction
-            )
-
-            print("")
-            print(
-                "WALL DETECTED:",
-                distance,
-                "cm"
-            )
-
-            print(
-                "CORNER:",
-                active_corner_direction.upper()
-            )
+            print("WALL DETECTED:", distance, "cm -> CORNER", race.active_corner_direction.upper())
 
             state = CORNER_APPROACH
 
             continue
 
-
         else:
 
-            # Nothing close enough to classify - any earlier bad
-            # reads no longer apply to whatever we encounter next.
-            wall_no_color_streak = 0
+            race.wall_no_color_streak = 0
 
-
-        # ----------------------------------------------------
         # Emergency protection.
-        # ----------------------------------------------------
+        if is_valid_distance(distance) and distance <= settings.EMERGENCY_CM:
 
-        if (
-            is_valid_distance(distance)
-            and
-            distance <= settings.EMERGENCY_CM
-        ):
+            print("EMERGENCY DISTANCE:", distance)
 
-            print(
-                "EMERGENCY DISTANCE:",
-                distance
-            )
-
-            car.backward(
-                settings.BACKUP_SPEED
-            )
+            car.backward(settings.BACKUP_SPEED)
 
             time.sleep_ms(180)
 
@@ -1067,698 +255,333 @@ while True:
             continue
 
 
-    # ========================================================
-    # TRAFFIC APPROACH
-    # ========================================================
+    # --------------------------------------------------
+    # APPROACH LOCKED TRAFFIC PILLAR
+    # --------------------------------------------------
 
     elif state == TRAFFIC_APPROACH:
 
-        car.forward(
-            settings.TRAFFIC_APPROACH_SPEED
-        )
+        car.forward(settings.TRAFFIC_APPROACH_SPEED)
 
+        distance = race.update_front_distance()
 
-        distance = update_front_distance()
+        if is_valid_distance(distance) and distance <= settings.TRAFFIC_PASS_TRIGGER_CM:
 
+            print(race.active_traffic_color.upper(), "PILLAR ->", race.active_traffic_direction.upper())
 
-        if (
-            is_valid_distance(distance)
-            and
-            distance
-            <=
-            settings.TRAFFIC_PASS_TRIGGER_CM
-        ):
+            # Refresh the pillar's camera position - it is now
+            # close and large, so this reading is more reliable
+            # than the one taken at the original classify distance.
+            traffic = race.scan_traffic_sign()
 
-            print("")
-            print(
-                active_traffic_color.upper(),
-                "PILLAR ->",
-                active_traffic_direction.upper()
-            )
-            print("")
+            if traffic is not None and traffic["color"] == race.active_traffic_color:
 
+                race.active_traffic_cx = traffic["cx"]
 
-            # Refresh the pillar's camera position right before the
-            # shift - it is now close and large, so this reading is
-            # more reliable than the one taken at the original
-            # classification distance.
-            traffic = scan_traffic_sign()
+            race.active_traffic_shift_ms = race.compute_shift_ms(race.active_traffic_cx)
 
-            if (
-                traffic is not None
-                and
-                traffic["color"] == active_traffic_color
-            ):
+            print("SHIFT SIZE:", race.active_traffic_shift_ms, "ms")
 
-                active_traffic_cx = traffic["cx"]
+            race.traffic_shift_started_ms = time.ticks_ms()
 
-            active_traffic_shift_ms = compute_shift_ms(
-                active_traffic_cx
-            )
-
-            print(
-                "SHIFT SIZE:",
-                active_traffic_shift_ms,
-                "ms"
-            )
-
-
-            traffic_shift_started_ms = (
-                time.ticks_ms()
-            )
-
-
-            shift_away_from_pillar(
-                active_traffic_direction
-            )
-
+            race.shift_away_from_pillar(race.active_traffic_direction)
 
             state = TRAFFIC_SHIFT
 
             continue
 
 
-    # ========================================================
-    # TRAFFIC SIDE SHIFT
-    # ========================================================
+    # --------------------------------------------------
+    # SIDESTEP AWAY FROM PILLAR
+    # --------------------------------------------------
 
     elif state == TRAFFIC_SHIFT:
 
-        shift_away_from_pillar(
-            active_traffic_direction
-        )
+        race.shift_away_from_pillar(race.active_traffic_direction)
 
+        elapsed = time.ticks_diff(now, race.traffic_shift_started_ms)
 
-        elapsed = time.ticks_diff(
-            now,
-            traffic_shift_started_ms
-        )
+        if elapsed >= race.active_traffic_shift_ms:
 
+            car.forward(settings.TRAFFIC_PASS_SPEED)
 
-        if elapsed >= active_traffic_shift_ms:
+            race.traffic_pass_started_ms = time.ticks_ms()
 
-            car.forward(
-                settings.TRAFFIC_PASS_SPEED
-            )
-
-
-            traffic_pass_started_ms = (
-                time.ticks_ms()
-            )
-
-            traffic_lost_count = 0
+            race.traffic_lost_count = 0
 
             state = TRAFFIC_PASS
 
             continue
 
 
-    # ========================================================
-    # PASS TRAFFIC PILLAR
-    # ========================================================
+    # --------------------------------------------------
+    # DRIVE PAST THE PILLAR
+    # --------------------------------------------------
 
     elif state == TRAFFIC_PASS:
 
-        car.forward(
-            settings.TRAFFIC_PASS_SPEED
-        )
+        car.forward(settings.TRAFFIC_PASS_SPEED)
 
-
-        elapsed = time.ticks_diff(
-            now,
-            traffic_pass_started_ms
-        )
-
+        elapsed = time.ticks_diff(now, race.traffic_pass_started_ms)
 
         if elapsed >= settings.TRAFFIC_MIN_PASS_MS:
 
-            traffic = (
-                scan_traffic_sign()
-            )
+            traffic = race.scan_traffic_sign()
 
+            if traffic is not None and traffic["color"] == race.active_traffic_color:
 
-            if (
-                traffic is not None
-                and
-                traffic["color"]
-                ==
-                active_traffic_color
-            ):
-
-                traffic_lost_count = 0
-
+                race.traffic_lost_count = 0
 
             else:
 
-                traffic_lost_count += 1
+                race.traffic_lost_count += 1
 
+            if race.traffic_lost_count >= settings.TRAFFIC_LOST_CONFIRMATIONS:
 
-            if (
-                traffic_lost_count
-                >=
-                settings.TRAFFIC_LOST_CONFIRMATIONS
-            ):
+                print("PILLAR CLEARED -> RECENTER")
 
-                print(
-                    "PILLAR CLEARED -> RECENTER"
-                )
+                race.traffic_recenter_started_ms = time.ticks_ms()
+                race.traffic_recenter_phase = 0
 
-
-                traffic_recenter_started_ms = (
-                    time.ticks_ms()
-                )
-
-                traffic_recenter_phase = 0
-
-
-                shift_back_to_route(
-                    active_traffic_direction
-                )
-
+                race.shift_back_to_route(race.active_traffic_direction)
 
                 state = TRAFFIC_RECENTER
 
                 continue
 
-
         if elapsed >= settings.TRAFFIC_MAX_PASS_MS:
 
-            print(
-                "PILLAR PASS TIMEOUT -> RECENTER"
-            )
+            print("PILLAR PASS TIMEOUT -> RECENTER")
 
+            race.traffic_recenter_started_ms = time.ticks_ms()
+            race.traffic_recenter_phase = 0
 
-            traffic_recenter_started_ms = (
-                time.ticks_ms()
-            )
-
-            traffic_recenter_phase = 0
-
-
-            shift_back_to_route(
-                active_traffic_direction
-            )
-
+            race.shift_back_to_route(race.active_traffic_direction)
 
             state = TRAFFIC_RECENTER
 
             continue
 
 
-    # ========================================================
+    # --------------------------------------------------
     # RETURN TO ROUTE AFTER PILLAR
-    # ========================================================
+    # --------------------------------------------------
 
     elif state == TRAFFIC_RECENTER:
 
-        elapsed = time.ticks_diff(
-            now,
-            traffic_recenter_started_ms
-        )
+        elapsed = time.ticks_diff(now, race.traffic_recenter_started_ms)
 
+        # Phase 0: undo the diagonal lean.
+        if race.traffic_recenter_phase == 0:
 
-        # ----------------------------------------------------
-        # Phase 0:
-        # undo the sideways shift.
-        # ----------------------------------------------------
+            race.shift_back_to_route(race.active_traffic_direction)
 
-        if traffic_recenter_phase == 0:
+            if elapsed >= race.active_traffic_shift_ms:
 
-            shift_back_to_route(
-                active_traffic_direction
-            )
+                race.traffic_recenter_phase = 1
 
+                race.traffic_recenter_started_ms = time.ticks_ms()
 
-            if elapsed >= active_traffic_shift_ms:
+                car.forward(settings.CORNER_EXIT_SPEED)
 
-                traffic_recenter_phase = 1
-
-                traffic_recenter_started_ms = (
-                    time.ticks_ms()
-                )
-
-
-                car.forward(
-                    settings.CORNER_EXIT_SPEED
-                )
-
-                traffic_centered_since_ms = 0
-
-
-        # ----------------------------------------------------
-        # Phase 1:
-        # the timed shift only gets us roughly back in line, so use
-        # the camera's track error to steer back to actual center
-        # instead of just driving forward for a fixed time.
-        # ----------------------------------------------------
-
+        # Phase 1: drive straight for a fixed time before handing
+        # back to normal driving. The K210 no longer reports a
+        # line-following error (see navigation/race.py history),
+        # so there is nothing left to confirm actual center with -
+        # this is a plain timed forward burst, same as the shift.
         else:
 
-            valid_track, error = read_track()
+            car.forward(settings.CORNER_EXIT_SPEED)
 
+            if elapsed >= settings.RECENTER_FORWARD_MS:
 
-            if valid_track:
+                print("TRAFFIC PASS COMPLETE - TURN COUNT:", race.total_turns)
 
-                action = track_follower.follow(
-                    error,
-                    current_lap()
-                )
+                # No corner count here - a pillar manoeuvre is not
+                # one of the twelve track corners.
+                race.clear_traffic()
 
-            else:
-
-                # No usable line reading yet - keep the car moving
-                # straight rather than stalling mid-manoeuvre.
-                car.forward(
-                    settings.CORNER_EXIT_SPEED
-                )
-
-                action = None
-
-
-            if action == "straight":
-
-                if traffic_centered_since_ms == 0:
-
-                    traffic_centered_since_ms = (
-                        time.ticks_ms()
-                    )
-
-            else:
-
-                traffic_centered_since_ms = 0
-
-
-            centered_ms = 0
-
-            if traffic_centered_since_ms != 0:
-
-                centered_ms = time.ticks_diff(
-                    now,
-                    traffic_centered_since_ms
-                )
-
-
-            recenter_confirmed = (
-                centered_ms >= settings.RECENTER_CONFIRM_MS
-            )
-
-            recenter_timed_out = (
-                elapsed >= settings.RECENTER_CAMERA_TIMEOUT_MS
-            )
-
-
-            if recenter_confirmed or recenter_timed_out:
-
-                print("")
-                print("TRAFFIC PASS COMPLETE")
-
-                if recenter_timed_out and not recenter_confirmed:
-
-                    print(
-                        "(camera recenter timed out,",
-                        "continuing on last known heading)"
-                    )
-
-                print(
-                    "90 DEGREE TURN COUNT:",
-                    total_turns
-                )
-                print("")
-
-
-                active_traffic_color = None
-                active_traffic_direction = None
-
-                traffic_lost_count = 0
-                traffic_recenter_phase = 0
-                traffic_centered_since_ms = 0
-
-
-                last_traffic_completed_ms = (
-                    time.ticks_ms()
-                )
-
-
-                # No corner count here.
-                #
-                # A pillar manoeuvre is not one of the twelve
-                # track corners.
                 state = DRIVING
 
                 continue
 
 
-    # ========================================================
+    # --------------------------------------------------
     # APPROACH TRACK WALL
-    # ========================================================
+    # --------------------------------------------------
 
     elif state == CORNER_APPROACH:
 
-        car.forward(
-            settings.CORNER_APPROACH_SPEED
-        )
+        car.forward(settings.CORNER_APPROACH_SPEED)
 
+        distance = race.update_front_distance()
 
-        distance = update_front_distance()
-
-
-        # ----------------------------------------------------
         # Keep checking for a pillar while approaching what we
-        # believe is the wall. A closer, larger blob is far more
-        # reliable than the original distant classification read,
-        # so a misclassified wall can still be corrected here
-        # instead of driving straight into an unavoidable pillar.
-        # ----------------------------------------------------
+        # believe is the wall - a closer, larger blob is far more
+        # reliable than the original distant classification read.
+        if is_valid_distance(distance) and distance > settings.WALL_RECHECK_MIN_CM:
 
-        if (
-            is_valid_distance(distance)
-            and
-            distance > settings.WALL_RECHECK_MIN_CM
-        ):
-
-            traffic = scan_traffic_sign()
+            traffic = race.scan_traffic_sign()
 
             if traffic is not None:
 
-                active_traffic_color = (
-                    traffic["color"]
-                )
+                race.lock_traffic(traffic)
 
-                active_traffic_direction = (
-                    traffic["direction"]
-                )
+                race.active_corner_direction = None
 
-                active_traffic_cx = (
-                    traffic["cx"]
-                )
-
-                traffic_seen_on_current_straight = True
-
-                active_corner_direction = None
-
-
-                print("")
-                print("WALL RECLASSIFIED AS PILLAR")
-                print(
-                    active_traffic_color.upper(),
-                    "PASS:",
-                    active_traffic_direction.upper()
-                )
-                print("")
-
+                print("WALL RECLASSIFIED AS PILLAR:", race.active_traffic_color.upper())
 
                 state = TRAFFIC_APPROACH
 
                 continue
 
+        if is_valid_distance(distance) and distance <= settings.TURN_TRIGGER_CM:
 
-        if (
-            is_valid_distance(distance)
-            and
-            distance <= settings.TURN_TRIGGER_CM
-        ):
+            race.record_straight_before_corner()
 
-            record_straight_before_corner()
+            print("START 90 DEGREE TURN:", race.active_corner_direction.upper(), "at", distance, "cm")
 
+            race.turn_started_ms = time.ticks_ms()
+            race.turn_saw_close_wall = False
 
-            print("")
-            print("================================")
-            print(
-                "START 90 DEGREE TURN:",
-                active_corner_direction.upper()
-            )
-            print(
-                "DISTANCE:",
-                distance,
-                "cm"
-            )
-            print("================================")
-            print("")
-
-
-            turn_started_ms = (
-                time.ticks_ms()
-            )
-
-            turn_saw_close_wall = False
-
-
-            drive_corner(
-                active_corner_direction
-            )
-
+            race.drive_corner(race.active_corner_direction)
 
             state = CORNER_TURNING
 
             continue
 
 
-    # ========================================================
+    # --------------------------------------------------
     # 90 DEGREE TRACK TURN
-    # ========================================================
+    # --------------------------------------------------
 
     elif state == CORNER_TURNING:
 
-        drive_corner(
-            active_corner_direction
-        )
+        race.drive_corner(race.active_corner_direction)
 
+        elapsed = time.ticks_diff(now, race.turn_started_ms)
 
-        elapsed = time.ticks_diff(
-            now,
-            turn_started_ms
-        )
-
-
-        distance = (
-            ultrasonic.get_stable_distance()
-        )
-
-
-        # ----------------------------------------------------
-        # Never leave the car turning forever.
-        # ----------------------------------------------------
+        distance = ultrasonic.get_stable_distance()
 
         if elapsed >= settings.TURN_TIMEOUT_MS:
 
-            print(
-                "TURN TIMEOUT -> TRIM"
-            )
+            print("TURN TIMEOUT -> TRIM")
 
-            corner_trim_started_ms = (
-                time.ticks_ms()
-            )
+            race.corner_trim_started_ms = time.ticks_ms()
 
             state = CORNER_TRIM
 
             continue
 
+        # Stage 1: confirm the sensor has actually swept close past
+        # the old wall before looking for it to release.
+        if not race.turn_saw_close_wall:
 
-        # ----------------------------------------------------
-        # STAGE 1: confirm the sensor has actually swept close
-        # past the old wall before we start looking for release.
-        # ----------------------------------------------------
+            if is_valid_distance(distance) and distance <= settings.TURN_WALL_CLOSE_CM:
 
-        if not turn_saw_close_wall:
+                race.turn_saw_close_wall = True
 
-            if (
-                is_valid_distance(distance)
-                and
-                distance <= settings.TURN_WALL_CLOSE_CM
-            ):
+                print("TURN: close wall confirmed", distance, "cm")
 
-                turn_saw_close_wall = True
-
-                print(
-                    "TURN: close wall confirmed",
-                    distance,
-                    "cm"
-                )
-
-
-        # ----------------------------------------------------
-        # STAGE 2: once the close wall has been seen, wait for
-        # the reading to grow again. That means the ultrasonic
-        # has swept away from the old wall and toward the new
-        # straight, and the pivot is done.
-        # ----------------------------------------------------
-
+        # Stage 2: once the close wall has been seen, the pivot is
+        # done once the reading grows again.
         else:
 
-            if (
-                elapsed >= settings.TURN_MIN_MS
-                and
-                (
-                    not is_valid_distance(distance)
-                    or
-                    distance
-                    >=
-                    settings.TURN_CLEAR_DISTANCE_CM
-                )
-            ):
+            released = not is_valid_distance(distance) or distance >= settings.TURN_CLEAR_DISTANCE_CM
 
-                print(
-                    "TURN RELEASE:",
-                    distance,
-                    "cm"
-                )
+            if elapsed >= settings.TURN_MIN_MS and released:
 
+                print("TURN RELEASE:", distance, "cm")
 
-                corner_trim_started_ms = (
-                    time.ticks_ms()
-                )
-
+                race.corner_trim_started_ms = time.ticks_ms()
 
                 state = CORNER_TRIM
 
                 continue
 
 
-    # ========================================================
+    # --------------------------------------------------
     # CORNER TRIM
-    # ========================================================
+    # --------------------------------------------------
     #
     # A short final pivot at reduced speed. The ultrasonic reports
     # "released" slightly before the car has actually completed a
-    # full 90 degrees, so this trims the remaining angle instead of
-    # stopping the instant release is detected.
+    # full 90 degrees, so this trims the remaining angle.
 
     elif state == CORNER_TRIM:
 
-        elapsed = time.ticks_diff(
-            now,
-            corner_trim_started_ms
-        )
-
+        elapsed = time.ticks_diff(now, race.corner_trim_started_ms)
 
         if elapsed < settings.TURN_TRIM_MS:
 
-            drive_corner(
-                active_corner_direction,
-                speed=settings.TURN_TRIM_SPEED
-            )
+            race.drive_corner(race.active_corner_direction, speed=settings.TURN_TRIM_SPEED)
 
             continue
 
-
-        print(
-            "TURN COMPLETE -> RECOVERY"
-        )
-
+        print("TURN COMPLETE -> RECOVERY")
 
         car.stop()
 
         time.sleep_ms(30)
 
-        car.forward(
-            settings.CORNER_EXIT_SPEED
-        )
+        car.forward(settings.CORNER_EXIT_SPEED)
 
-
-        corner_recovery_started_ms = (
-            time.ticks_ms()
-        )
-
+        race.corner_recovery_started_ms = time.ticks_ms()
 
         state = CORNER_RECOVERY
 
         continue
 
 
-    # ========================================================
+    # --------------------------------------------------
     # CORNER RECOVERY
-    # ========================================================
+    # --------------------------------------------------
 
     elif state == CORNER_RECOVERY:
 
-        car.forward(
-            settings.CORNER_EXIT_SPEED
-        )
+        car.forward(settings.CORNER_EXIT_SPEED)
 
-
-        elapsed = time.ticks_diff(
-            now,
-            corner_recovery_started_ms
-        )
-
+        elapsed = time.ticks_diff(now, race.corner_recovery_started_ms)
 
         if elapsed >= settings.CORNER_RECOVERY_MS:
 
-            # This is the only point at which a physical track
-            # corner is officially counted.
-            count_completed_corner()
+            # This is the only point a physical track corner is
+            # officially counted.
+            race.count_completed_corner()
 
+            race.clear_corner()
 
-            active_corner_direction = None
+            if race.total_turns >= settings.TOTAL_TURNS:
 
+                race.finish_drive_ms = race.estimate_finish_drive_time()
 
-            # ------------------------------------------------
-            # TWELVE CORNERS = THREE LAPS
-            # ------------------------------------------------
+                print("THREE LAPS COMPLETE - RETURN ESTIMATE:", race.finish_drive_ms, "ms")
 
-            if total_turns >= settings.TOTAL_TURNS:
-
-                finish_drive_ms = (
-                    estimate_finish_drive_time()
-                )
-
-
-                print("")
-                print("================================")
-                print("THREE LAPS COMPLETE")
-                print(
-                    "RETURN-TO-START ESTIMATE:",
-                    finish_drive_ms,
-                    "ms"
-                )
-                print("================================")
-                print("")
-
-
-                finish_started_ms = (
-                    time.ticks_ms()
-                )
-
+                race.finish_started_ms = time.ticks_ms()
 
                 state = FINISH_RETURN
 
                 continue
 
-
-            # ------------------------------------------------
-            # Start measuring the next straight.
-            # ------------------------------------------------
-
-            straight_started_ms = (
-                time.ticks_ms()
-            )
-
-            traffic_seen_on_current_straight = False
-
+            race.straight_started_ms = time.ticks_ms()
+            race.traffic_seen_on_current_straight = False
 
             state = DRIVING
 
             continue
 
 
-    # ========================================================
+    # --------------------------------------------------
     # APPROXIMATE RETURN TO STARTING POSITION
-    # ========================================================
+    # --------------------------------------------------
 
     elif state == FINISH_RETURN:
 
-        elapsed = time.ticks_diff(
-            now,
-            finish_started_ms
-        )
+        elapsed = time.ticks_diff(now, race.finish_started_ms)
 
+        if elapsed < race.finish_drive_ms:
 
-        if elapsed < finish_drive_ms:
-
-            car.forward(
-                settings.FINISH_SPEED
-            )
-
+            car.forward(settings.FINISH_SPEED)
 
         else:
 
@@ -1769,5 +592,4 @@ while True:
             continue
 
 
-    # Small scheduler pause.
     time.sleep_ms(10)

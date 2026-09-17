@@ -1,6 +1,3 @@
-import time
-
-
 class TrafficColorDetector:
     """
     Detect red and green WRO traffic pillars.
@@ -8,51 +5,42 @@ class TrafficColorDetector:
     Red means the vehicle passes on the right.
     Green means the vehicle passes on the left.
 
-    The detector only handles colour recognition. Motor movement
-    remains in main.py so one state machine controls the car.
+    The K210 already picks the strongest blob among the colours
+    allowed by its current mode and reports it by name, so this
+    class only has to put the link in MODE_TRAFFIC and translate
+    that one report into a pass side.
     """
 
     def __init__(
         self,
-        cam,
-        red_index: int = 1,
-        green_index: int = 2,
-        pixels_threshold: int = 60,
-        area_threshold: int = 60,
+        link,
         min_width: int = 5,
         min_height: int = 5,
-        min_area: int = 40,
+        min_pixels: int = 40,
         confirmations: int = 1
     ) -> None:
         """
         Configure the traffic-pillar detector.
 
         Args:
-            cam: Initialised ACB_Canmv camera.
-            red_index: K210 colour index for red.
-            green_index: K210 colour index for green.
-            pixels_threshold: Camera pixel threshold.
-            area_threshold: Camera area threshold.
+            link: Connected K210Link.
             min_width: Minimum accepted blob width.
             min_height: Minimum accepted blob height.
-            min_area: Minimum accepted width x height.
+            min_pixels: Minimum accepted blob pixel count. The K210
+                already applies its own (looser) threshold before
+                reporting anything at all - this is a stricter
+                second filter on the ESP32 side.
             confirmations: Number of repeated detections required.
 
         Returns:
             None.
         """
 
-        self.cam = cam
-
-        self.red_index = red_index
-        self.green_index = green_index
-
-        self.pixels_threshold = pixels_threshold
-        self.area_threshold = area_threshold
+        self.link = link
 
         self.min_width = min_width
         self.min_height = min_height
-        self.min_area = min_area
+        self.min_pixels = min_pixels
 
         self.confirmations = confirmations
 
@@ -74,134 +62,62 @@ class TrafficColorDetector:
 
     def _valid_blob(self) -> bool:
         """
-        Check whether the current camera blob is larger than noise.
+        Check whether the current link blob is larger than noise.
 
         Returns:
             True when the current blob is usable.
         """
 
-        width = self.cam.getW
-        height = self.cam.getH
-
-        area = width * height
-
-        if width < self.min_width:
+        if self.link.w < self.min_width:
             return False
 
-        if height < self.min_height:
+        if self.link.h < self.min_height:
             return False
 
-        if area < self.min_area:
+        if self.link.pixels < self.min_pixels:
             return False
 
         return True
 
 
-    def _read_colour(
-        self,
-        index: int,
-        colour: str,
-        direction: str
-    ) -> object:
-        """
-        Read one traffic-sign colour.
-
-        Args:
-            index: K210 colour index.
-            colour: Name stored in the returned result.
-            direction: Side used to pass this pillar.
-
-        Returns:
-            Detection dictionary or None.
-        """
-
-        found = self.cam.color_recognize(
-            index,
-            self.pixels_threshold,
-            self.area_threshold
-        )
-
-        if not found:
-            return None
-
-        if not self._valid_blob():
-            return None
-
-        width = self.cam.getW
-        height = self.cam.getH
-
-        return {
-            "color": colour,
-            "direction": direction,
-            "width": width,
-            "height": height,
-            "area": width * height,
-            "cx": self.cam.getCX,
-            "cy": self.cam.getCY
-        }
-
-
     def detect(self) -> object:
         """
-        Check red and green and return the strongest valid pillar.
-
-        When both colours are seen, the larger blob is selected.
-        The detection is then required to meet the configured
-        confirmation count.
+        Check for a red or green pillar.
 
         Returns:
             Traffic-sign dictionary or None.
         """
 
-        red = self._read_colour(
-            self.red_index,
-            "red",
-            "right"
-        )
+        self.link.set_mode(self.link.MODE_TRAFFIC)
 
-        time.sleep_ms(15)
+        found = self.link.poll()
 
-        green = self._read_colour(
-            self.green_index,
-            "green",
-            "left"
-        )
-
-
-        if (
-            red is None
-            and
-            green is None
-        ):
+        if not found or self.link.name not in ("red", "green"):
 
             self.reset()
 
             return None
 
+        if not self._valid_blob():
 
-        if (
-            red is not None
-            and
-            green is not None
-        ):
+            self.reset()
 
-            if red["area"] >= green["area"]:
-                selected = red
-            else:
-                selected = green
+            return None
 
+        color = self.link.name
+        direction = "right" if color == "red" else "left"
 
-        elif red is not None:
+        result = {
+            "color": color,
+            "direction": direction,
+            "width": self.link.w,
+            "height": self.link.h,
+            "area": self.link.pixels,
+            "cx": self.link.cx,
+            "cy": self.link.cy
+        }
 
-            selected = red
-
-
-        else:
-
-            selected = green
-
-
-        if selected["color"] == "red":
+        if color == "red":
 
             self.red_count += 1
             self.green_count = 0
@@ -210,8 +126,7 @@ class TrafficColorDetector:
 
                 self.reset()
 
-                return selected
-
+                return result
 
         else:
 
@@ -222,7 +137,6 @@ class TrafficColorDetector:
 
                 self.reset()
 
-                return selected
-
+                return result
 
         return None
