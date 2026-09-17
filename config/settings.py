@@ -156,6 +156,20 @@ TURN_TRIGGER_CM = 28
 # Last-resort collision protection.
 EMERGENCY_CM = 9
 
+# A single missed colour read at BOUNDARY_CLASSIFY_CM must not be
+# enough to commit to a wall/corner - that is an irreversible 90
+# degree turn, and this mat has pillars close enough together that
+# one bad frame could otherwise turn the robot straight into one.
+# This many consecutive close-range "no colour" reads are required
+# first.
+WALL_CONFIRM_COUNT = 3
+
+# Keep re-checking for a pillar while approaching what we believe
+# is the wall, down to this distance. A closer, larger blob is far
+# more reliable than the original distant classification read, so
+# a misclassified wall can still be caught and corrected here.
+WALL_RECHECK_MIN_CM = 20
+
 
 # ============================================================
 # TURN COMPLETION
@@ -198,7 +212,28 @@ CORNER_RECOVERY_MS = 280
 # Begin the sideways avoidance once the pillar is this close.
 TRAFFIC_PASS_TRIGGER_CM = 40
 
-TRAFFIC_SHIFT_MS = 400
+# ------------------------------------------------------------
+# SIDESTEP SIZING
+# ------------------------------------------------------------
+#
+# Pillars on this mat are not all the same distance into the lane
+# - some sit close to the outer wall, others sit further toward
+# the center obstacle. A single fixed shift is either too much or
+# too little depending on where the pillar actually is, so the
+# shift duration is scaled by how far off-center the pillar's
+# camera blob (getCX) is at the moment we commit to passing it.
+#
+# CALIBRATE ON THE REAL CAMERA: TRAFFIC_CAMERA_CENTER_X should be
+# the getCX reading for a pillar dead-center in frame, and
+# TRAFFIC_CX_FULL_OFFSET_PX the offset (in the same units) at
+# which the pillar is already at the edge of the lane.
+
+TRAFFIC_CAMERA_CENTER_X = 160
+
+TRAFFIC_CX_FULL_OFFSET_PX = 80
+
+TRAFFIC_SHIFT_MS_MIN = 250
+TRAFFIC_SHIFT_MS_MAX = 550
 
 # We do not look for the end of a pillar immediately.
 TRAFFIC_MIN_PASS_MS = 450
@@ -208,8 +243,25 @@ TRAFFIC_MAX_PASS_MS = 1700
 
 TRAFFIC_LOST_CONFIRMATIONS = 2
 
-# Do not immediately rediscover the same pillar.
-TRAFFIC_COOLDOWN_MS = 900
+# Do not immediately rediscover the pillar we just passed - it can
+# still be at the edge of the camera frame right after RECENTER.
+# This mat places pillars close together on the same straight, so
+# this must be short enough to still catch the next one in time
+# rather than a long blanket cooldown.
+TRAFFIC_COOLDOWN_MS = 300
+
+# After undoing the sideways shift, use the camera's line-following
+# error to confirm the car is actually back at track center instead
+# of trusting the timed strafe alone (motor response is never
+# perfectly symmetric, so blind timing drifts over a run).
+#
+# The reading must stay centered for this long before the pillar
+# manoeuvre is considered complete.
+RECENTER_CONFIRM_MS = 120
+
+# Do not let camera-based recentering run forever if the track
+# camera cannot get a usable reading (e.g. still mid-shift).
+RECENTER_CAMERA_TIMEOUT_MS = 700
 
 # Camera scan interval while travelling on the straight.
 TRAFFIC_SCAN_INTERVAL_MS = 250

@@ -28,6 +28,7 @@ from libs import ACB_Canmv
 
 from navigation.startup import StartupDirectionDetector
 from navigation.traffic import TrafficColorDetector
+from navigation.track import TrackFollower
 
 
 # ============================================================
@@ -120,6 +121,8 @@ startup_detector = StartupDirectionDetector(
 # TRAFFIC DETECTOR
 # ============================================================
 
+track_follower = TrackFollower(car)
+
 traffic_detector = TrafficColorDetector(
     cam=cam,
 
@@ -182,6 +185,10 @@ last_ultrasonic_ms = (
 
 active_corner_direction = None
 
+# Consecutive close-range frames with no traffic colour detected.
+# Used to require several bad reads before committing to a wall.
+wall_no_color_streak = 0
+
 turn_started_ms = 0
 
 turn_saw_close_wall = False
@@ -199,6 +206,10 @@ active_traffic_color = None
 
 active_traffic_direction = None
 
+active_traffic_cx = settings.TRAFFIC_CAMERA_CENTER_X
+
+active_traffic_shift_ms = settings.TRAFFIC_SHIFT_MS_MIN
+
 traffic_shift_started_ms = 0
 
 traffic_pass_started_ms = 0
@@ -206,6 +217,8 @@ traffic_pass_started_ms = 0
 traffic_recenter_started_ms = 0
 
 traffic_recenter_phase = 0
+
+traffic_centered_since_ms = 0
 
 traffic_lost_count = 0
 
@@ -307,6 +320,26 @@ def update_front_distance() -> float:
     return front_distance
 
 
+def read_track() -> tuple:
+    """
+    Read the camera's line-following error.
+
+    Used only to confirm/steer back to track center after a traffic
+    pillar manoeuvre - normal straight-line driving is otherwise
+    open-loop and relies on the ultrasonic for corner timing.
+
+    Returns:
+        (True, error) if the camera has a usable line reading.
+        (False, 0) otherwise.
+    """
+
+    if cam.visual_patrol():
+
+        return True, cam.Visual_data
+
+    return False, 0
+
+
 # ============================================================
 # TRAFFIC HELPERS
 # ============================================================
@@ -339,6 +372,49 @@ def scan_traffic_sign() -> object:
     )
 
     return result
+
+
+def compute_shift_ms(cx: int) -> int:
+    """
+    Size the sideways avoidance shift to how off-center a pillar is.
+
+    A pillar close to the camera's center line is likely already
+    close to the outer wall or the center obstacle and needs a
+    smaller sideways move; one far off-center needs more clearance.
+    Scales linearly between TRAFFIC_SHIFT_MS_MIN and _MAX using the
+    blob's horizontal camera position (getCX).
+
+    Args:
+        cx: Horizontal camera position of the pillar blob.
+
+    Returns:
+        Shift duration in milliseconds.
+    """
+
+    offset = abs(
+        cx - settings.TRAFFIC_CAMERA_CENTER_X
+    )
+
+    fraction = (
+        offset
+        /
+        settings.TRAFFIC_CX_FULL_OFFSET_PX
+    )
+
+    if fraction > 1:
+        fraction = 1
+
+    return int(
+        settings.TRAFFIC_SHIFT_MS_MIN
+        +
+        fraction
+        *
+        (
+            settings.TRAFFIC_SHIFT_MS_MAX
+            -
+            settings.TRAFFIC_SHIFT_MS_MIN
+        )
+    )
 
 
 def shift_away_from_pillar(direction: str) -> None:
@@ -843,6 +919,10 @@ while True:
                     traffic["direction"]
                 )
 
+                active_traffic_cx = (
+                    traffic["cx"]
+                )
+
                 traffic_seen_on_current_straight = True
 
 
@@ -902,19 +982,35 @@ while True:
                     traffic["direction"]
                 )
 
+                active_traffic_cx = (
+                    traffic["cx"]
+                )
+
                 traffic_seen_on_current_straight = True
+
+                wall_no_color_streak = 0
 
                 state = TRAFFIC_APPROACH
 
                 continue
 
 
-            # No red or green:
-            # at this point the ultrasonic has already confirmed
-            # that something physical is in front of us.
+            # No red or green on this frame.
             #
-            # For the current challenge logic we therefore treat
-            # it as the boundary wall.
+            # A single missed read is not enough evidence to commit
+            # to an irreversible 90 degree turn - this mat can have
+            # a pillar sitting right where a corner would also be
+            # expected, so require several consecutive bad reads
+            # before treating it as the boundary wall.
+            wall_no_color_streak += 1
+
+            if wall_no_color_streak < settings.WALL_CONFIRM_COUNT:
+
+                continue
+
+
+            wall_no_color_streak = 0
+
             active_corner_direction = (
                 course_direction
             )
@@ -934,6 +1030,13 @@ while True:
             state = CORNER_APPROACH
 
             continue
+
+
+        else:
+
+            # Nothing close enough to classify - any earlier bad
+            # reads no longer apply to whatever we encounter next.
+            wall_no_color_streak = 0
 
 
         # ----------------------------------------------------
@@ -995,6 +1098,31 @@ while True:
             print("")
 
 
+            # Refresh the pillar's camera position right before the
+            # shift - it is now close and large, so this reading is
+            # more reliable than the one taken at the original
+            # classification distance.
+            traffic = scan_traffic_sign()
+
+            if (
+                traffic is not None
+                and
+                traffic["color"] == active_traffic_color
+            ):
+
+                active_traffic_cx = traffic["cx"]
+
+            active_traffic_shift_ms = compute_shift_ms(
+                active_traffic_cx
+            )
+
+            print(
+                "SHIFT SIZE:",
+                active_traffic_shift_ms,
+                "ms"
+            )
+
+
             traffic_shift_started_ms = (
                 time.ticks_ms()
             )
@@ -1027,7 +1155,7 @@ while True:
         )
 
 
-        if elapsed >= settings.TRAFFIC_SHIFT_MS:
+        if elapsed >= active_traffic_shift_ms:
 
             car.forward(
                 settings.TRAFFIC_PASS_SPEED
@@ -1161,7 +1289,7 @@ while True:
             )
 
 
-            if elapsed >= settings.TRAFFIC_SHIFT_MS:
+            if elapsed >= active_traffic_shift_ms:
 
                 traffic_recenter_phase = 1
 
@@ -1174,23 +1302,83 @@ while True:
                     settings.CORNER_EXIT_SPEED
                 )
 
+                traffic_centered_since_ms = 0
+
 
         # ----------------------------------------------------
         # Phase 1:
-        # short forward movement before returning to full speed.
+        # the timed shift only gets us roughly back in line, so use
+        # the camera's track error to steer back to actual center
+        # instead of just driving forward for a fixed time.
         # ----------------------------------------------------
 
         else:
 
-            car.forward(
-                settings.CORNER_EXIT_SPEED
+            valid_track, error = read_track()
+
+
+            if valid_track:
+
+                action = track_follower.follow(
+                    error,
+                    current_lap()
+                )
+
+            else:
+
+                # No usable line reading yet - keep the car moving
+                # straight rather than stalling mid-manoeuvre.
+                car.forward(
+                    settings.CORNER_EXIT_SPEED
+                )
+
+                action = None
+
+
+            if action == "straight":
+
+                if traffic_centered_since_ms == 0:
+
+                    traffic_centered_since_ms = (
+                        time.ticks_ms()
+                    )
+
+            else:
+
+                traffic_centered_since_ms = 0
+
+
+            centered_ms = 0
+
+            if traffic_centered_since_ms != 0:
+
+                centered_ms = time.ticks_diff(
+                    now,
+                    traffic_centered_since_ms
+                )
+
+
+            recenter_confirmed = (
+                centered_ms >= settings.RECENTER_CONFIRM_MS
+            )
+
+            recenter_timed_out = (
+                elapsed >= settings.RECENTER_CAMERA_TIMEOUT_MS
             )
 
 
-            if elapsed >= 220:
+            if recenter_confirmed or recenter_timed_out:
 
                 print("")
                 print("TRAFFIC PASS COMPLETE")
+
+                if recenter_timed_out and not recenter_confirmed:
+
+                    print(
+                        "(camera recenter timed out,",
+                        "continuing on last known heading)"
+                    )
+
                 print(
                     "90 DEGREE TURN COUNT:",
                     total_turns
@@ -1203,6 +1391,7 @@ while True:
 
                 traffic_lost_count = 0
                 traffic_recenter_phase = 0
+                traffic_centered_since_ms = 0
 
 
                 last_traffic_completed_ms = (
@@ -1231,6 +1420,56 @@ while True:
 
 
         distance = update_front_distance()
+
+
+        # ----------------------------------------------------
+        # Keep checking for a pillar while approaching what we
+        # believe is the wall. A closer, larger blob is far more
+        # reliable than the original distant classification read,
+        # so a misclassified wall can still be corrected here
+        # instead of driving straight into an unavoidable pillar.
+        # ----------------------------------------------------
+
+        if (
+            is_valid_distance(distance)
+            and
+            distance > settings.WALL_RECHECK_MIN_CM
+        ):
+
+            traffic = scan_traffic_sign()
+
+            if traffic is not None:
+
+                active_traffic_color = (
+                    traffic["color"]
+                )
+
+                active_traffic_direction = (
+                    traffic["direction"]
+                )
+
+                active_traffic_cx = (
+                    traffic["cx"]
+                )
+
+                traffic_seen_on_current_straight = True
+
+                active_corner_direction = None
+
+
+                print("")
+                print("WALL RECLASSIFIED AS PILLAR")
+                print(
+                    active_traffic_color.upper(),
+                    "PASS:",
+                    active_traffic_direction.upper()
+                )
+                print("")
+
+
+                state = TRAFFIC_APPROACH
+
+                continue
 
 
         if (
