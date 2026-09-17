@@ -102,6 +102,51 @@ class Car:
         )
 
 
+    def corner_left(self, speed=None, inner_ratio=0.3):
+        """
+        Drive a forward-left arc instead of pivoting in place.
+
+        Left side (inner wheels) runs slower, right side (outer
+        wheels) runs at full speed, both still moving forward.
+        This uses the driver's per-motor motorControl() directly,
+        because Move() only exposes fixed presets (forward, strafe,
+        pivot, diagonals) and has no arc/differential preset.
+
+        Motor sides come from how the vendor driver itself wires
+        Clockwise/Contrarotate in ACB_SmartCar_V2.Move(): motors 1
+        and 2 move together as the left side, 3 and 4 as the right
+        side.
+        """
+        if speed is None:
+            speed = self.forward_speed
+
+        inner_speed = speed * inner_ratio
+
+        self.driver.motorControl(1, inner_speed)
+        self.driver.motorControl(2, inner_speed)
+        self.driver.motorControl(3, speed)
+        self.driver.motorControl(4, speed)
+
+
+    def corner_right(self, speed=None, inner_ratio=0.3):
+        """
+        Drive a forward-right arc instead of pivoting in place.
+
+        Right side (inner wheels) runs slower, left side (outer
+        wheels) runs at full speed, both still moving forward.
+        See corner_left() for why motorControl() is used directly.
+        """
+        if speed is None:
+            speed = self.forward_speed
+
+        inner_speed = speed * inner_ratio
+
+        self.driver.motorControl(1, speed)
+        self.driver.motorControl(2, speed)
+        self.driver.motorControl(3, inner_speed)
+        self.driver.motorControl(4, inner_speed)
+
+
     def diagonal_forward_left(self, speed=None):
         """
         Move diagonally forward and left.
